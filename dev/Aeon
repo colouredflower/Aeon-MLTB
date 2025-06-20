@@ -1,0 +1,414 @@
+#!/bin/bash
+# Aeon
+
+set -euo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+
+TEMP_DIR=$(mktemp -d)
+JDOWNLOADER_HOME="/JDownloader"
+BIN_DIR="/usr/local/bin"
+
+download_files() {
+    mkdir -p "$JDOWNLOADER_HOME" "$BIN_DIR"
+    local arch=$(uname -m)
+    
+    if [ "$arch" = "x86_64" ]; then
+        wget -qO "$BIN_DIR/xnox" "https://github.com/userdocs/qbittorrent-nox-static/releases/latest/download/x86_64-qbittorrent-nox" &
+        wget -qO "$TEMP_DIR/ffmpeg.tar.xz" "https://github.com/5hojib/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-linux64-gpl-7.1.tar.xz" &
+        wget -qO "$TEMP_DIR/uv.tar.gz" "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-unknown-linux-gnu.tar.gz" &
+    else
+        wget -qO "$BIN_DIR/xnox" "https://github.com/userdocs/qbittorrent-nox-static/releases/latest/download/aarch64-qbittorrent-nox" &
+        wget -qO "$TEMP_DIR/ffmpeg.tar.xz" "https://github.com/5hojib/FFmpeg-Builds/releases/latest/download/ffmpeg-n7.1-latest-linuxarm64-gpl-7.1.tar.xz" &
+        wget -qO "$TEMP_DIR/uv.tar.gz" "https://github.com/astral-sh/uv/releases/latest/download/uv-aarch64-unknown-linux-gnu.tar.gz" &
+    fi
+    wget -qO "$JDOWNLOADER_HOME/JDownloader.jar" http://installer.jdownloader.org/JDownloader.jar &
+    
+    wait
+}
+
+install_packages() {
+    apt-get update
+    apt-get upgrade -y
+
+    # Base packages for all architectures
+    local base_packages=(
+        python3.13
+        python3.13-dev
+        python3.13-venv
+        libpython3.13
+        libpython3.13-dev
+        python3-pip
+        sabnzbdplus
+        aria2
+        sox
+        libsox-fmt-all
+        curl
+        zstd
+        xz-utils
+        git
+        libmagic-dev
+        p7zip-full
+        p7zip-rar
+        tzdata
+        wget
+        openjdk-21-jre
+        openjdk-21-jre-headless
+    )
+
+    # MEGA SDK build dependencies (for both x86_64 and aarch64)
+    local mega_build_packages=(
+        autoconf
+        automake
+        build-essential
+        cmake
+        g++
+        gcc
+        gettext
+        gpg-agent
+        intltool
+        libtool
+        make
+        unzip
+        zip
+        libcurl4-openssl-dev
+        libsodium-dev
+        libssl-dev
+        libcrypto++-dev
+        libc-ares-dev
+        libsqlite3-dev
+        libfreeimage-dev
+        swig
+        libboost-all-dev
+        libpthread-stubs0-dev
+        zlib1g-dev
+    )
+
+    # MEGA SDK runtime dependencies
+    local mega_runtime_packages=(
+        libcares2
+        libcurl4
+        libuv1
+        libcrypto++8
+        libsodium23
+        libsqlite3-0
+        libssl3
+        libfreeimage3
+        zlib1g
+    )
+
+    # Detect architecture
+    local arch=$(uname -m)
+    local packages_to_install=("${base_packages[@]}")
+
+    # Install MEGA SDK dependencies for both architectures
+    echo "🏗️  Installing packages for $arch architecture (including MEGA SDK dependencies)"
+    packages_to_install+=("${mega_build_packages[@]}")
+    packages_to_install+=("${mega_runtime_packages[@]}")
+
+    apt-get install -y --no-install-recommends "${packages_to_install[@]}"
+
+    ln -sf /usr/bin/python3.13 /usr/bin/python3
+    ln -sf /usr/bin/python3.13 /usr/bin/python
+}
+
+install_mega_sdk() {
+    local arch=$(uname -m)
+    echo "🔧 Installing MEGA SDK v4.8.0 from source on $arch architecture (Ubuntu 25.04 + Python 3.13)..."
+
+    # Verify Python environment
+    echo "🔍 Checking Python environment..."
+    python3 --version
+
+    # Install setuptools (includes distutils functionality for Python 3.13)
+    echo "📦 Installing setuptools for Python 3.13 distutils support..."
+    pip3 install --break-system-packages setuptools || {
+        echo "❌ Failed to install setuptools"
+        exit 1
+    }
+
+    # Clone and build MEGA SDK from source
+    echo "� Cloning MEGA SDK v4.8.0 source code..."
+    git clone https://github.com/meganz/sdk.git --depth=1 -b v4.8.0 /home/sdk || {
+        echo "❌ Failed to clone MEGA SDK repository"
+        exit 1
+    }
+
+    cd /home/sdk
+    rm -rf .git
+
+    echo "🔧 Configuring MEGA SDK build..."
+    # Update autotools and generate configure script
+    autoupdate -fIv && ./autogen.sh || {
+        echo "❌ Failed to run autogen.sh"
+        exit 1
+    }
+
+    # Configure with Python 3.13 support and optimizations for both architectures
+    echo "⚙️  Configuring MEGA SDK for $arch architecture with Python 3.13..."
+    ./configure \
+        --disable-silent-rules \
+        --enable-python \
+        --with-sodium \
+        --disable-examples \
+        --with-python=/usr/bin/python3.13 \
+        PYTHON=/usr/bin/python3.13 \
+        PYTHON_VERSION=3.13 || {
+        echo "❌ Failed to configure MEGA SDK"
+        exit 1
+    }
+
+    # Build MEGA SDK using all available CPU cores
+    echo "� Building MEGA SDK (this may take several minutes)..."
+    make -j$(nproc --all) || {
+        echo "❌ Failed to build MEGA SDK"
+        exit 1
+    }
+
+    # Build and install Python bindings
+    echo "� Building MEGA SDK Python bindings for Python 3.13..."
+    cd bindings/python/
+
+    # Build wheel
+    python3.13 setup.py bdist_wheel || {
+        echo "❌ Failed to build MEGA SDK Python wheel"
+        exit 1
+    }
+
+    # Install the wheel using pip with system packages flag for Ubuntu 25.04
+    echo "📦 Installing MEGA SDK Python bindings..."
+    pip3 install --break-system-packages --no-cache-dir dist/megasdk-4.8.0-*.whl || {
+        echo "❌ Failed to install MEGA SDK Python bindings"
+        exit 1
+    }
+
+    # Set up library paths for MEGA SDK shared libraries
+    echo "🔧 Configuring MEGA SDK library paths..."
+
+    # Find where MEGA SDK was installed
+    MEGA_INSTALL_PATH=$(python3 -c "
+import sys
+from pathlib import Path
+for path in sys.path:
+    mega_path = Path(path) / 'mega'
+    if mega_path.exists():
+        print(path)
+        break
+" 2>/dev/null || echo "/usr/local/lib/python3.13/dist-packages")
+
+    echo "📁 MEGA SDK installed in: $MEGA_INSTALL_PATH"
+
+    # Create library configuration for MEGA SDK
+    echo "$MEGA_INSTALL_PATH/mega" > /etc/ld.so.conf.d/megasdk.conf
+
+    # Update library cache
+    ldconfig
+
+    # Change to a different directory to avoid importing from source
+    cd /tmp
+
+    # Update library cache to ensure shared libraries are found
+    echo "🔧 Updating library cache..."
+    ldconfig
+
+    # Set library path for MEGA SDK shared libraries
+    export LD_LIBRARY_PATH="/usr/local/lib/python3.13/dist-packages/mega:/usr/lib/python3/dist-packages/mega:${LD_LIBRARY_PATH:-}"
+
+    # Verify installation with comprehensive system-wide detection
+    echo "🔍 Verifying MEGA SDK installation with system-wide detection..."
+    python3 -c "
+import sys
+from pathlib import Path
+
+# System-wide search paths for MEGA SDK
+search_paths = [
+    '/usr/local/lib/python3.13/dist-packages',
+    '/usr/lib/python3/dist-packages',
+    '/usr/lib/python3.13/dist-packages',
+    '/usr/local/lib/python3.12/dist-packages',
+    '/usr/lib/python3.12/dist-packages',
+    f'{sys.prefix}/lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages',
+    f'{sys.prefix}/lib/python{sys.version_info.major}.{sys.version_info.minor}/dist-packages',
+]
+
+print('🔍 Searching for MEGA SDK in system-wide paths...')
+mega_found = False
+mega_path = None
+
+# Try standard import first
+try:
+    import mega
+    api = mega.MegaApi('test')
+    version = api.getVersion()
+    print('✅ MEGA SDK v4.8.0 imported successfully via standard import')
+    print(f'📋 API version: {version}')
+    print(f'📊 API methods available: {len([m for m in dir(api) if not m.startswith(\"_\")])}')
+    print(f'🐍 Python executable: {sys.executable}')
+    print(f'📁 MEGA module location: {mega.__file__}')
+    mega_found = True
+except ImportError as e:
+    print(f'⚠️  Standard import failed: {e}')
+except Exception as e:
+    print(f'⚠️  Standard import validation failed: {e}')
+
+# If standard import failed, search system-wide paths
+if not mega_found:
+    for path in search_paths:
+        mega_dir = Path(path) / 'mega'
+        if mega_dir.exists():
+            print(f'🔍 Found MEGA SDK in: {path}')
+            try:
+                if str(Path(path)) not in sys.path:
+                    sys.path.insert(0, str(Path(path)))
+
+                import mega
+                api = mega.MegaApi('test')
+                version = api.getVersion()
+                print('✅ MEGA SDK v4.8.0 imported successfully via system-wide search')
+                print(f'📋 API version: {version}')
+                print(f'📊 API methods available: {len([m for m in dir(api) if not m.startswith(\"_\")])}')
+                print(f'🐍 Python executable: {sys.executable}')
+                print(f'📁 MEGA module location: {mega.__file__}')
+                mega_path = path
+                mega_found = True
+                break
+            except Exception as e:
+                print(f'⚠️  Failed to import from {path}: {e}')
+                continue
+
+if not mega_found:
+    print('❌ MEGA SDK not found in any system-wide location')
+    raise ImportError('MEGA SDK not found')
+else:
+    print('🎉 MEGA SDK verification completed successfully!')
+" || {
+        echo "❌ MEGA SDK installation verification failed"
+        echo "🔍 Debugging import issue..."
+
+        # Check installed packages
+        echo "📦 Installed MEGA packages:"
+        pip3 list | grep -i mega || echo "No MEGA packages found"
+
+        # Check Python import path
+        echo "🐍 Python import paths:"
+        python3 -c "import sys; [print(f'  {p}') for p in sys.path if p]"
+
+        # Check for MEGA SDK files in common locations
+        echo "🔍 Searching for MEGA SDK files..."
+        find /usr -name 'mega' -type d 2>/dev/null | head -10 || echo "No MEGA directories found"
+        find /usr -name '*mega*' -name '*.so' 2>/dev/null | head -10 || echo "No MEGA shared libraries found"
+
+        # Try to import and show error
+        echo "🔍 Import error details:"
+        python3 -c "
+try:
+    import mega
+    print('✅ Import successful')
+except Exception as e:
+    print(f'❌ Import failed: {e}')
+    import traceback
+    traceback.print_exc()
+"
+        exit 1
+    }
+
+    # Clean up build dependencies to reduce image size
+    echo "🧹 Cleaning up MEGA SDK build dependencies..."
+    apt-get remove -y \
+        autoconf \
+        automake \
+        build-essential \
+        cmake \
+        g++ \
+        gcc \
+        gettext \
+        gpg-agent \
+        intltool \
+        libtool \
+        make \
+        unzip \
+        zip \
+        libcurl4-openssl-dev \
+        libssl-dev \
+        libc-ares-dev \
+        libsqlite3-dev \
+        swig \
+        libboost-all-dev \
+        libpthread-stubs0-dev \
+        zlib1g-dev
+
+    apt-get autoremove -y
+    apt-get autoclean -y
+
+    # Clean up Python build tools
+    echo "🧹 Removing Python build tools..."
+    pip3 uninstall -y setuptools || echo "setuptools already removed or not found"
+
+    # Clean up source directory
+    rm -rf /home/sdk
+
+    # Return to original directory
+    cd /
+
+    echo "✅ MEGA SDK v4.8.0 installed successfully for $arch architecture with Python 3.13 support"
+}
+
+# Process and move files
+process_files() {
+    chmod 700 "$BIN_DIR/xnox"
+    
+    # Extract FFmpeg
+    tar -xf "$TEMP_DIR/ffmpeg.tar.xz" -C "$TEMP_DIR"
+    local ffmpeg_dir=$(find "$TEMP_DIR" -type d -name "ffmpeg-n7.1-latest-linux*" | head -n 1)
+    mv "$ffmpeg_dir/bin/ffmpeg" /usr/bin/xtra
+    mv "$ffmpeg_dir/bin/ffprobe" /usr/bin/ffprobe
+    mv "$ffmpeg_dir/bin/ffplay" /usr/bin/ffplay
+    chmod +x /usr/bin/xtra /usr/bin/ffprobe /usr/bin/ffplay
+    
+    # Extract UV
+    tar -xzf "$TEMP_DIR/uv.tar.gz" -C "$TEMP_DIR"
+    mv $(find "$TEMP_DIR" -type f -name "uv" | head -n 1) /usr/bin/uv
+    chmod +x /usr/bin/uv
+    
+    # Install rclone
+    curl https://rclone.org/install.sh | bash
+    mv /usr/bin/rclone /usr/bin/xone
+    mv /usr/bin/aria2c /usr/bin/xria
+    # mv /usr/bin/ffmpeg /usr/bin/xtra
+    mv /usr/bin/sabnzbdplus /usr/bin/xnzb
+}
+
+cleanup() {
+    apt-get purge -y wget \
+        perl \
+        xz-utils \
+        perl-modules-5.40
+    apt-get install -y --no-install-recommends \
+        git \
+        curl \
+        cpulimit
+    apt-get autoremove -y --purge
+    apt-get autoclean -y
+    apt-get clean -y
+    rm -rf \
+        /var/lib/apt/lists/* \
+        "$TEMP_DIR" \
+        Aeon \
+        Dockerfile \
+        ~/.cache \
+        /tmp/* \
+        /var/tmp/*
+
+    local arch=$(uname -m)
+    echo "✅ Cleanup completed - MEGA SDK v4.8.0 installed system-wide for $arch architecture"
+}
+
+main() {
+    install_packages
+    download_files
+    process_files
+    install_mega_sdk
+    cleanup
+}
+
+main
